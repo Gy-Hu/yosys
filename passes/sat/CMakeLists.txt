@@ -46,6 +46,20 @@ yosys_pass(supercover
 yosys_pass(fmcombine
 	fmcombine.cc
 )
+yosys_pass(spv
+	spv.cc
+	REQUIRES
+		read_verilog
+		chformal
+		opt_clean
+		memory_nordff
+		clk2fflogic
+		memory_map
+		formalff
+		setundef
+		fmcombine
+		flatten
+)
 yosys_pass(mutate
 	mutate.cc
 )

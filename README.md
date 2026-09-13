@@ -1,6 +1,10 @@
 yosys – Yosys Open SYnthesis Suite
 ===================================
 
+This fork's `dev-spv` branch adds native Security Path Verification with the `spv`
+pass. Build from source below, then run `./build/yosys -p 'help spv'` for usage.
+SBY runs the proofs and generates counterexample traces.
+
 This is a framework for RTL synthesis tools. It currently has
 extensive Verilog-2005 support and provides a basic set of
 synthesis algorithms for various application domains.
@@ -70,9 +74,8 @@ on Read the Docs.
 When cloning Yosys, some required libraries are included as git submodules. Make
 sure to call e.g.
 
-	$ git clone https://github.com/YosysHQ/yosys.git
+	$ git clone --branch dev-spv --recurse-submodules https://github.com/Gy-Hu/yosys.git
 	$ cd yosys
-	$ git submodule update --init
 
 A C++ compiler with C++20 support is required as well as some standard tools
 such as GNU Flex, GNU Bison (>=3.8), CMake (>=3.28), Make (or other CMake

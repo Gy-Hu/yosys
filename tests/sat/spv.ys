@@ -1,0 +1,78 @@
+read_verilog -formal spv.v
+insbuf
+proc
+design -save original
+
+# Jasper reference: sibling is proven, downstream and registered paths have CEXs.
+spv -from selected -to sibling spv_branches
+prep -top spv_miter
+check -assert
+sat -set-assumes -prove-asserts -seq 3 -verify
+
+design -load original
+spv -from selected -to downstream spv_branches
+prep -top spv_miter
+check -assert
+sat -set-assumes -prove-asserts -seq 1 -falsify
+
+design -load original
+spv -from selected -to state spv_branches
+prep -top spv_miter
+check -assert
+sat -set-assumes -prove-asserts -seq 3 -falsify
+
+# Disabled injection and an unselected bit must not create differences.
+design -load original
+spv -from selected -to downstream -from-precond disabled spv_branches
+prep -top spv_miter
+check -assert
+chformal -cover -remove
+sat -set-assumes -prove-asserts -seq 3 -verify
+
+design -load original
+spv -from selected[1] -to downstream[0] spv_branches
+prep -top spv_miter
+check -assert
+sat -set-assumes -prove-asserts -seq 1 -verify
+
+design -load original
+spv -from selected[1] -to downstream[1] spv_branches
+prep -top spv_miter
+check -assert
+sat -set-assumes -prove-asserts -seq 1 -falsify
+
+# Memory read state and explicit unknowns must be paired before proving equality.
+design -load original
+spv -from secret -to value spv_memory
+prep -top spv_miter
+check -assert
+sat -set-assumes -prove-asserts -seq 3 -verify
+
+design -load original
+spv -from secret -to value spv_unknown
+prep -top spv_miter
+check -assert
+sat -set-assumes -prove-asserts -seq 1 -verify
+
+# A constraint on the cut source applies to the injected values in both runs.
+design -load original
+spv -from selected -to downstream -assume "selected == 0" spv_branches
+prep -top spv_miter
+check -assert
+sat -set-assumes -prove-asserts -seq 1 -verify
+
+# Constraining its former driver must not constrain the injected source.
+design -load original
+spv -from selected -to downstream -assume "public_value == 0" spv_branches
+prep -top spv_miter
+check -assert
+sat -set-assumes -prove-asserts -seq 1 -falsify
+
+# With a startup reset, direct leakage is disabled for two steps, then possible.
+design -load original
+spv -from selected -to downstream -clock clk -reset "!public_value[0]" spv_branches
+prep -top spv_miter
+check -assert
+chformal -cover -remove
+sat -set-assumes -prove-asserts -seq 2 -verify
+sat -set-assumes -prove-asserts -seq 3 -falsify
