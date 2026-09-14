@@ -383,10 +383,11 @@ struct SpvPass : Pass
 		log("    -name <name>                    assertion name (default: information_flow)\n");
 		log("    -module <name>                  output module (default: spv_miter)\n\n");
 		log("    -init shared|zero|one           unspecified state initial values (default: shared)\n\n");
-		log("Select exactly one flattened module with no processes or blackboxes.\n");
+		log("Select one flattened module with no processes or blackboxes. Without a\n");
+		log("selection, the module marked top is used (read_slang --top / hierarchy -top).\n");
 		log("For read_verilog, use insbuf before proc to preserve named source branches:\n");
 		log("    read_verilog -formal -sv dut.sv\n    hierarchy -top dut\n");
-		log("    insbuf\n    proc\n    flatten\n    spv -from secret -to observable dut\n");
+		log("    insbuf\n    proc\n    flatten\n    spv -from secret -to observable\n");
 		log("    prep -top spv_miter\n\n");
 		log("Do not run opt_clean/clean before spv: they can merge the named source nets.\n");
 		log("Slang already preserves continuous assignments as buffers.\n");
@@ -401,11 +402,11 @@ struct SpvPass : Pass
 		log("Clock/reset options also add covers for the source/destination active windows.\n");
 		log("Unspecified clocks remain unconstrained. Use multiclock on in SBY. Example:\n");
 		log("    spv -clock clk -reset \"!rst_n\" -assume \"enable || idle\"\\\n");
-		log("        -from key -to debug -to-precond \"count == 3\" dut\n\n");
+		log("        -from key -to debug -to-precond \"count == 3\"\n\n");
 	}
 
 	// Validate the command, build privately, then publish one completed product module.
-	// Example: spv -from key -to debug dut -> a new spv_miter; dut remains unchanged.
+	// Example: spv -from key -to debug -> a new spv_miter; the DUT stays unchanged.
 	void execute(std::vector<std::string> args, Design *design) override
 	{
 		std::vector<std::string> from, to, clocks, assumptions;
@@ -445,9 +446,10 @@ struct SpvPass : Pass
 			log_cmd_error("SPV -init must be shared, zero, or one.\n");
 		if (from.empty() || to.empty()) log_cmd_error("SPV requires -from and -to.\n");
 		auto modules = design->selected_modules();
-		if (GetSize(modules) != 1 || !modules.front()->is_selected_whole())
-			log_cmd_error("SPV requires exactly one fully selected module.\n");
-		auto original = modules.front();
+		// One named module wins; otherwise use the module marked top after flatten leftovers.
+		auto original = GetSize(modules) == 1 ? modules.front() : design->top_module();
+		if (!original || !original->is_selected_whole())
+			log_cmd_error("SPV requires one fully selected module, or a top module.\n");
 		if (original->has_processes()) log_cmd_error("Run proc before spv (and insbuf before proc).\n");
 		CellTypes cell_types(design);
 		for (auto cell : original->cells()) {
