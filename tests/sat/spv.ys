@@ -19,6 +19,7 @@ design -load original
 spv -from selected -to state spv_branches
 prep -top spv_miter
 check -assert
+clk2fflogic
 sat -set-assumes -prove-asserts -seq 3 -falsify
 
 # Disabled injection and an unselected bit must not create differences.
@@ -46,6 +47,7 @@ design -load original
 spv -from secret -to value spv_memory
 prep -top spv_miter
 check -assert
+clk2fflogic
 sat -set-assumes -prove-asserts -seq 3 -verify
 
 design -load original
@@ -68,11 +70,18 @@ prep -top spv_miter
 check -assert
 sat -set-assumes -prove-asserts -seq 1 -falsify
 
-# With a startup reset, direct leakage is disabled for two steps, then possible.
+# One-step reset delays direct leakage until the second single-clock state.
+design -load original
+spv -from selected -to downstream -reset "!public_value[0]" spv_branches
+prep -top spv_miter
+check -assert
+sat -set-assumes -prove-asserts -seq 1 -verify
+sat -set-assumes -prove-asserts -seq 2 -falsify
+
+# Explicit half-cycle clocks keep reset active through the first rising edge.
 design -load original
 spv -from selected -to downstream -clock clk -reset "!public_value[0]" spv_branches
 prep -top spv_miter
 check -assert
-chformal -cover -remove
 sat -set-assumes -prove-asserts -seq 2 -verify
 sat -set-assumes -prove-asserts -seq 3 -falsify

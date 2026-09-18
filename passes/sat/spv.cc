@@ -116,8 +116,8 @@ struct SpvBuilder
 		if (sources.empty() || destinations.empty())
 			log_cmd_error("SPV sources and destinations must not be empty.\n");
 		source_width = GetSize(sources);
-		has_from_condition = !from_precond.empty() || !clocks.empty() || !reset.empty();
-		has_to_condition = !to_precond.empty() || !clocks.empty() || !reset.empty();
+		has_from_condition = !from_precond.empty();
+		has_to_condition = !to_precond.empty();
 		std::vector<std::string> expressions = {from_precond, to_precond, reset};
 		expressions.insert(expressions.end(), assumptions.begin(), assumptions.end());
 		auto conditions = read_conditions(expressions);
@@ -197,8 +197,8 @@ struct SpvBuilder
 		return results;
 	}
 
-	// Add the same half-cycle clock and startup reset used by the benchmark harnesses.
-	// Example: -clock clk -reset !rst_n -> clk=0,1,0,...; rst_n=0,0,1,1,...
+	// Apply startup reset for one cycle, or two steps with explicit half-cycle clocks.
+	// Example: -reset rst -> rst=1,0,0,...; adding -clock clk -> rst=1,1,0,...
 	void add_environment(const std::vector<std::string> &clocks, bool has_reset, const std::vector<SigSpec> &conditions)
 	{
 		if (!clocks.empty()) {
@@ -214,19 +214,20 @@ struct SpvBuilder
 		}
 		SigSpec active = State::S1;
 		if (has_reset) {
-			// Two global FFs delay activation by two steps, spanning the first rising edge.
-			for (int step = 0; step < 2; step++) {
+			// Explicit clocks need two steps to span their first rising edge.
+			const int reset_steps = clocks.empty() ? 1 : 2;
+			for (int step = 0; step < reset_steps; step++) {
 				auto delayed = base->addWire(NEW_ID_SUFFIX("reset_startup"));
 				delayed->attributes[ID::init] = State::S0;
 				base->addFf(NEW_ID, active, delayed);
 				active = delayed;
 			}
 			base->addAssume(NEW_ID, base->Eq(NEW_ID, conditions[2], base->Not(NEW_ID, active)), State::S1);
+			from_condition = base->And(NEW_ID, active, from_condition);
+			to_condition = base->And(NEW_ID, active, to_condition);
 		}
 		for (int i = 3; i < GetSize(conditions); i++)
 			base->addAssume(NEW_ID, conditions[i], active);
-		from_condition = base->And(NEW_ID, active, from_condition);
-		to_condition = base->And(NEW_ID, active, to_condition);
 	}
 
 	// Redirect only readers of the selected net, including property observation points.
@@ -278,7 +279,6 @@ struct SpvBuilder
 			if (cell->type == ID($print)) base->remove(cell);
 		Pass::call_on_module(&temporary, base, "opt_clean");
 		Pass::call_on_module(&temporary, base, "memory_nordff");
-		Pass::call_on_module(&temporary, base, "clk2fflogic");
 		Pass::call_on_module(&temporary, base, "memory_map -formal");
 		Pass::call_on_module(&temporary, base, "formalff -anyinit2ff");
 		Pass::call_on_module(&temporary, base, "setundef -undriven -anyseq");
@@ -293,6 +293,8 @@ struct SpvBuilder
 	// Example: C1=0 -> source A=B; C2=1 -> require all destination bits A=B.
 	Module *build()
 	{
+		// Startup reset also keeps sources equal without an explicit from-precondition.
+		const bool gate_source_changes = !from_condition.is_fully_ones();
 		cut_sources();
 		prepare_base();
 		product = temporary.addModule(ID(spv_product));
@@ -316,7 +318,7 @@ struct SpvBuilder
 		}
 		auto common_source = product->Anyseq(NEW_ID_SUFFIX("source_a"), source_width);
 		auto changed_source = product->Anyseq(NEW_ID_SUFFIX("source_b"), source_width);
-		auto source_b = has_from_condition
+		auto source_b = gate_source_changes
 			? product->Mux(NEW_ID, common_source, changed_source, outputs_a.at(from_condition_port))
 			: changed_source;
 		run_a->setPort(source_port, common_source);
@@ -391,17 +393,21 @@ struct SpvPass : Pass
 		log("    prep -top spv_miter\n\n");
 		log("Do not run opt_clean/clean before spv: they can merge the named source nets.\n");
 		log("Slang already preserves continuous assignments as buffers.\n");
-		log("The pass cuts readers, lowers clocks/memories with Yosys, and uses fmcombine\n");
-		log("to share initial state and environment values. SBY handles proving and traces.\n\n");
+		log("The pass cuts readers, maps memories, and uses fmcombine to share initial\n");
+		log("state and environment values. SBY handles clock conversion, proving and traces.\n\n");
 		log("Conditions use Verilog expressions over flattened wires; quote spaces.\n");
 		log("Widths, signedness and HDL ranges come from the DUT. No SVA sequences,\n");
 		log("design functions or package types are imported. Unknown names are errors.\n");
-		log("Clocks start at 0 and toggle every formal step. Reset is active for the first\n");
-		log("two steps, then inactive forever. Source differences, comparison and -assume\n");
-		log("are enabled after reset. Without -reset they are enabled immediately.\n");
-		log("Clock/reset options also add covers for the source/destination active windows.\n");
-		log("Unspecified clocks remain unconstrained. Use multiclock on in SBY. Example:\n");
-		log("    spv -clock clk -reset \"!rst_n\" -assume \"enable || idle\"\\\n");
+		log("With -reset, reset is active for one formal step without -clock, or two\n");
+		log("steps with explicit half-cycle clocks, then inactive forever. During reset,\n");
+		log("sources stay equal and output comparison and -assume are disabled.\n");
+		log("Without -reset, checking starts immediately from the specified initial state.\n");
+		log("Only explicit source/destination preconditions add cover properties.\n\n");
+		log("For single-clock SBY proofs, omit -clock and use multiclock off. Explicit\n");
+		log("-clock inputs start at 0 and toggle together every formal step; use\n");
+		log("multiclock on for this waveform. Other clocks remain unconstrained.\n");
+		log("Single-clock SBY example after proc and flatten (multiclock off):\n");
+		log("    spv -reset \"!rst_n\" -assume \"enable || idle\"\\\n");
 		log("        -from key -to debug -to-precond \"count == 3\"\n\n");
 	}
 
