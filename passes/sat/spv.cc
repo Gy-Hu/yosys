@@ -75,6 +75,7 @@ struct SpvBuilder
 	IdString property_name;
 	std::string initial_state;
 	SigSpec sources, destinations, from_condition, to_condition;
+	std::string source_bit_names;
 	int source_width;
 	bool has_from_condition, has_to_condition;
 
@@ -97,12 +98,20 @@ struct SpvBuilder
 		}
 
 		// Keep command order, and reject repeated bits rather than silently changing it.
+		// Also name every source bit for spv_path. Example: -from key[9:8] -> "key[8] key[9]".
 		pool<SigBit> selected;
 		for (const auto &text : from) {
 			auto signal = resolve_spv_signal(base, text);
-			for (auto bit : signal)
+			for (auto bit : signal) {
 				if (!selected.insert(bit).second)
 					log_cmd_error("Repeated SPV source bit in '%s'.\n", text);
+				std::string bit_name;
+				for (const auto &part : bit.wire->get_hdlname_attribute())
+					bit_name += (bit_name.empty() ? "" : ".") + part;
+				if (bit_name.empty()) bit_name = bit.wire->name.unescape();
+				if (bit.wire->width > 1) bit_name += stringf("[%d]", bit.wire->to_hdl_index(bit.offset));
+				source_bit_names += (source_bit_names.empty() ? "" : " ") + bit_name;
+			}
 			sources.append(signal);
 		}
 		selected.clear();
@@ -327,6 +336,7 @@ struct SpvBuilder
 		auto equal = product->Eq(NEW_ID, outputs_a.at(destination_port), outputs_b.at(destination_port));
 		auto assertion = product->addAssert(property_name.str(), equal, outputs_a.at(to_condition_port));
 		assertion->set_string_attribute(ID(spv_property), property_name.unescape());
+		assertion->set_string_attribute(ID(spv_source_bits), source_bit_names);
 		auto add_cover = [&](const std::string &role, SigSpec condition) {
 			product->addCover(property_name.str() + ":" + role, condition, State::S1);
 		};
@@ -346,14 +356,19 @@ struct SpvBuilder
 		Pass::call(&temporary, {"fmcombine", "-initeq", "-anyeq", "-nop", product->name.str(), "run_a", "run_b"});
 		// fmcombine copies hdlname unchanged. Give each side a distinct HDL scope so
 		// AIGER witnesses and SMT replay refer to the same, unambiguous signal names.
+		// Example: "\count_gate" without hdlname -> hdlname "run_b count".
 		auto combined = temporary.module("$fmcombine" + base->name.str());
 		log_assert(combined);
 		auto distinguish_run = [](auto *object) {
-			std::string side = object->name.str().ends_with("_gate") ? "run_b" : "run_a";
+			bool is_gate = object->name.str().ends_with("_gate");
+			std::string side = is_gate ? "run_b" : "run_a";
 			if (object->has_attribute(ID::hdlname)) {
 				auto hdlname = object->get_hdlname_attribute();
 				hdlname.insert(hdlname.begin(), side);
 				object->set_hdlname_attribute(hdlname);
+			} else if (object->name.isPublic() && (is_gate || object->name.str().ends_with("_gold"))) {
+				std::string name = object->name.unescape();
+				object->set_hdlname_attribute({side, name.substr(0, name.size() - 5)});
 			}
 			if (object->has_attribute(ID(scopename)))
 				object->set_string_attribute(ID(scopename), side + " " + object->get_string_attribute(ID(scopename)));
@@ -394,7 +409,8 @@ struct SpvPass : Pass
 		log("Do not run opt_clean/clean before spv: they can merge the named source nets.\n");
 		log("Slang already preserves continuous assignments as buffers.\n");
 		log("The pass cuts readers, maps memories, and uses fmcombine to share initial\n");
-		log("state and environment values. SBY handles clock conversion, proving and traces.\n\n");
+		log("state and environment values. SBY handles clock conversion, proving and traces.\n");
+		log("Use spv_path on a counterexample to see how the difference reaches the destination.\n\n");
 		log("Conditions use Verilog expressions over flattened wires; quote spaces.\n");
 		log("Widths, signedness and HDL ranges come from the DUT. No SVA sequences,\n");
 		log("design functions or package types are imported. Unknown names are errors.\n");

@@ -60,6 +60,12 @@ yosys_pass(spv
 		fmcombine
 		flatten
 )
+yosys_pass(spv_path
+	spv_path.cc
+	REQUIRES
+		sim
+		fstdata
+)
 yosys_pass(mutate
 	mutate.cc
 )
