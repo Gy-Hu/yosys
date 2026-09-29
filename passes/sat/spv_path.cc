@@ -12,6 +12,8 @@
 #include "kernel/celltypes.h"
 #include "kernel/fstdata.h"
 #include "kernel/yw.h"
+#include <filesystem>
+#include <numeric>
 #include <tuple>
 
 USING_YOSYS_NAMESPACE
@@ -52,6 +54,23 @@ struct PathEntry
 	int step, last_step;
 	std::string label, value_a, value_b, note;
 	std::vector<std::string> controls; // mux selects equal in both runs that let the difference pass
+};
+
+// One signal of the taint waveform: its bits in both runs and its name below the top scope.
+// Example: run-A wire mul.in_a -> scope {"mul"}, name "in_a", range "[3:0]".
+struct WaveSignal
+{
+	std::vector<std::string> scope;
+	std::string name, range; // range is "" for a one-bit wire
+	SigSpec bits_a, bits_b;  // LSB first
+
+	// Example: scope {"mul"}, name "in_a" -> "mul.in_a".
+	std::string dotted_name() const
+	{
+		std::string text;
+		for (auto &part : scope) text += part + ".";
+		return text + name;
+	}
 };
 
 struct SpvPathWorker
@@ -107,6 +126,15 @@ struct SpvPathWorker
 		std::string name = user_name(wire);
 		if (wire->width > 1) name += stringf("[%d]", wire->to_hdl_index(offset));
 		return name;
+	}
+
+	// Split a -from bit name into signal and HDL index. Example: "key[7]" -> ("key", "7");
+	// a one-bit wire "rst" -> ("rst", "").
+	static std::pair<std::string, std::string> split_bit_name(const std::string &name)
+	{
+		if (name.back() != ']') return {name, ""};
+		auto bracket = name.rfind('[');
+		return {name.substr(0, bracket), name.substr(bracket + 1, name.size() - bracket - 2)};
 	}
 
 	// Replay the witness with every wire recorded, including internal ones, and read it back.
@@ -423,10 +451,8 @@ struct SpvPathWorker
 		// Example: mul.cnt[1] -> "mul.cnt"; injected bit "key[7]" -> "key".
 		pool<int> source_nodes(graph.sources.begin(), graph.sources.end());
 		auto signal_of = [&](int n) -> std::string {
-			if (source_nodes.count(n)) {
-				std::string name = source_bit_names.at(drivers.at(graph.nodes[n].bit_a).offset);
-				return name.back() == ']' ? name.substr(0, name.rfind('[')) : name;
-			}
+			if (source_nodes.count(n))
+				return split_bit_name(source_bit_names.at(drivers.at(graph.nodes[n].bit_a).offset)).first;
 			auto named = run_a_names.find(graph.nodes[n].bit_a);
 			return named == run_a_names.end() ? "" : user_name(named->second.first);
 		};
@@ -490,7 +516,213 @@ struct SpvPathWorker
 		return stringf("%d-%d", entry.step, entry.last_step);
 	}
 
-	void run(const std::string &witness_file, const std::string &dot_file)
+	// Signals of the taint waveform, like the fanin Jasper exports for a counterexample:
+	// first the -from signals with the values the two runs actually read, then every named
+	// run-A signal in the structural fanin of the destination, sorted by name.
+	// Example: buffered_mul -> in_a, in_b (injected), buff.busy, ..., mul.in_a, ..., out_valid.
+	std::vector<WaveSignal> wave_signals(Cell *comparison, const DiffGraph &graph,
+		const std::vector<std::string> &source_bit_names)
+	{
+		// Run A reads the $anyseq that drives a found source bit. Run B reads the output of the
+		// cell that drives the same bit in run B: the source-choice $mux, whose A input is run A's
+		// value, or its own $anyseq. prep may narrow the $mux to the bits run B reads, so pair
+		// bits through A -> Y. Example: se_cache's 704 source bits, $mux narrowed to 384.
+		const DiffNode &source = graph.nodes.at(graph.sources.front());
+		SigSpec injected_a = sigmap(drivers.at(source.bit_a).cell->getPort(ID::Y));
+		Cell *choice = driver(source.bit_b, source.step).cell;
+		SigSpec choice_y = sigmap(choice->getPort(ID::Y));
+		SigSpec choice_a = choice->type == ID($mux) ? sigmap(choice->getPort(ID::A)) : injected_a;
+		if (GetSize(injected_a) != GetSize(source_bit_names) || GetSize(choice_a) != GetSize(choice_y))
+			log_error("The injected source does not match the %d -from bits; rerun spv to rebuild the model.\n",
+				GetSize(source_bit_names));
+		dict<SigBit, SigBit> run_b_of;
+		for (int i = 0; i < GetSize(choice_y); i++)
+			run_b_of[choice_a[i]] = choice_y[i];
+		// A source bit that run B never reads cannot make a visible difference: draw it untainted.
+		SigSpec injected_b;
+		int unread = 0;
+		for (auto bit : injected_a) {
+			auto found = run_b_of.find(bit);
+			injected_b.append(found != run_b_of.end() ? found->second : bit);
+			unread += found == run_b_of.end();
+		}
+		if (unread > 0)
+			log("%d of %d source bits are not read by run B; they are drawn without taint.\n",
+				unread, GetSize(injected_a));
+
+		// Group the -from bits into signals. Example: "in_a[0] in_a[1]" -> in_a with (0, 0), (1, 1).
+		std::vector<std::string> source_names;
+		dict<std::string, std::vector<std::pair<int, int>>> source_bits; // name -> (HDL index, injected offset)
+		pool<std::string> sliced; // sources given as bits of a wider wire
+		for (int i = 0; i < GetSize(source_bit_names); i++) {
+			auto [name, index] = split_bit_name(source_bit_names[i]);
+			if (!source_bits.count(name)) source_names.push_back(name);
+			if (!index.empty()) sliced.insert(name);
+			source_bits[name].push_back({index.empty() ? 0 : std::stoi(index), i});
+		}
+		std::vector<WaveSignal> signals;
+		for (auto &name : source_names) {
+			auto &bits = source_bits[name];
+			std::sort(bits.begin(), bits.end());
+			WaveSignal signal;
+			signal.scope = split_tokens(name, ".");
+			signal.name = signal.scope.back();
+			signal.scope.pop_back();
+			for (int k = 0; k < GetSize(bits); k++) {
+				if (bits[k].first != bits[0].first + k)
+					log_error("Source %s is not one contiguous slice; spv_path cannot draw it as one signal.\n", name);
+				signal.bits_a.append(injected_a[bits[k].second]);
+				signal.bits_b.append(injected_b[bits[k].second]);
+			}
+			// Example: key[15:8] -> "[15:8]"; a single bit key[7] -> "[7]".
+			if (sliced.count(name))
+				signal.range = GetSize(bits) == 1 ? stringf("[%d]", bits[0].first) :
+					stringf("[%d:%d]", bits.back().first, bits.front().first);
+			signals.push_back(signal);
+		}
+
+		// Structural fanin of the run-A destination, one cell at a time.
+		pool<SigBit> fanin;
+		pool<Cell *> visited;
+		std::vector<SigBit> pending;
+		for (auto bit : sigmap(comparison->getPort(ID::A))) pending.push_back(bit);
+		while (!pending.empty()) {
+			SigBit bit = pending.back();
+			pending.pop_back();
+			if (!bit.wire || !fanin.insert(bit).second) continue;
+			auto found = drivers.find(bit);
+			if (found == drivers.end() || !visited.insert(found->second.cell).second) continue; // top input, or seen
+			for (auto &connection : found->second.cell->connections())
+				if (found->second.cell->input(connection.first))
+					for (auto input : sigmap(connection.second)) pending.push_back(input);
+		}
+
+		pool<std::string> source_set(source_names.begin(), source_names.end());
+		std::vector<WaveSignal> fanin_signals;
+		for (auto wire : module->wires()) {
+			auto hdlname = wire->get_hdlname_attribute();
+			if (GetSize(hdlname) < 3 || hdlname[1] != "run_a") continue;
+			SigSpec bits_a = sigmap(wire);
+			bool in_fanin = false;
+			for (auto bit : bits_a) in_fanin |= fanin.count(bit) > 0;
+			if (!in_fanin) continue;
+			// Under a -from name the design reads the injected value, which is already listed.
+			std::string name = user_name(wire);
+			if (source_set.count(name)) continue;
+			auto twin = run_b_wires.find(name);
+			if (twin == run_b_wires.end())
+				log_error("Run-A wire %s has no run-B copy.\n", name);
+			WaveSignal signal{{hdlname.begin() + 2, hdlname.end() - 1}, hdlname.back(), "", bits_a, sigmap(twin->second)};
+			if (wire->width > 1)
+				signal.range = stringf("[%d:%d]", wire->to_hdl_index(wire->width - 1), wire->to_hdl_index(0));
+			fanin_signals.push_back(signal);
+		}
+		std::sort(fanin_signals.begin(), fanin_signals.end(),
+			[](const WaveSignal &x, const WaveSignal &y) { return x.dotted_name() < y.dotted_name(); });
+		signals.insert(signals.end(), fanin_signals.begin(), fanin_signals.end());
+		return signals;
+	}
+
+	// Short VCD identifier of signal number n. Example: 0 -> "!", 94 -> "!\"".
+	static std::string vcd_id(int n)
+	{
+		std::string id;
+		do {
+			id += char('!' + n % 94);
+			n /= 94;
+		} while (n > 0);
+		return id;
+	}
+
+	// Write run A's value of every signal plus a one-bit <name>__taint that is 1 while the two
+	// runs differ on any of its bits. Step k is at time k * cycle_width, as in SBY's trace.vcd.
+	// Example: in_a = 4'b0000 with in_a__taint = 1 at steps 1-2 of buffered_mul.
+	void write_vcd(const std::string &filename, const std::vector<WaveSignal> &signals)
+	{
+		std::ofstream vcd(filename);
+		if (!vcd) log_error("Cannot write %s.\n", filename);
+		vcd << "$version Yosys spv_path $end\n$timescale 1ns $end\n";
+		vcd << "$scope module " << module->name.unescape() << " $end\n";
+		// Sorted by scope, every scope is opened once. Signal s uses ids 2s (value) and 2s+1 (taint).
+		std::vector<int> order(GetSize(signals));
+		std::iota(order.begin(), order.end(), 0);
+		std::sort(order.begin(), order.end(), [&](int x, int y) {
+			return std::tie(signals[x].scope, signals[x].name) < std::tie(signals[y].scope, signals[y].name);
+		});
+		std::vector<std::string> open;
+		for (int s : order) {
+			auto &scope = signals[s].scope;
+			size_t common = 0;
+			while (common < open.size() && common < scope.size() && open[common] == scope[common]) common++;
+			for (; open.size() > common; open.pop_back()) vcd << "$upscope $end\n";
+			for (; open.size() < scope.size(); open.push_back(scope[open.size()]))
+				vcd << "$scope module " << scope[open.size()] << " $end\n";
+			std::string range = signals[s].range.empty() ? "" : " " + signals[s].range;
+			vcd << stringf("$var wire %d %s %s%s $end\n", GetSize(signals[s].bits_a), vcd_id(2 * s), signals[s].name, range);
+			vcd << stringf("$var wire 1 %s %s__taint $end\n", vcd_id(2 * s + 1), signals[s].name);
+		}
+		for (; !open.empty(); open.pop_back()) vcd << "$upscope $end\n";
+		vcd << "$upscope $end\n$enddefinitions $end\n";
+
+		// Write only changes; the first step writes every value.
+		std::vector<std::string> last(2 * GetSize(signals));
+		auto write_change = [&](int id, const std::string &text) {
+			if (text == last[id]) return;
+			vcd << text << "\n";
+			last[id] = text;
+		};
+		for (int step = 0; step < GetSize(values); step++) {
+			vcd << "#" << step * cycle_width << "\n";
+			for (int s = 0; s < GetSize(signals); s++) {
+				Const value_a = value(signals[s].bits_a, step);
+				std::string bits = value_a.as_string(); // MSB first
+				write_change(2 * s, GetSize(bits) == 1 ? bits + vcd_id(2 * s) : "b" + bits + " " + vcd_id(2 * s));
+				bool differs = value_a != value(signals[s].bits_b, step);
+				write_change(2 * s + 1, (differs ? "1" : "0") + vcd_id(2 * s + 1));
+			}
+		}
+		// Close the last step so viewers draw it with a full step width.
+		vcd << "#" << GetSize(values) * cycle_width << "\n";
+		log("Wrote %s: %d signals with taint.\n", filename, GetSize(signals));
+	}
+
+	// GTKWave view of the taint waveform: the text path's signals in path order, then the
+	// rest of the fanin, each followed by its taint in red. Open with: gtkwave path.gtkw
+	void write_gtkw(const std::string &filename, const std::string &vcd_file,
+		const std::vector<WaveSignal> &signals, const std::vector<PathEntry> &entries)
+	{
+		dict<std::string, int> by_name;
+		for (int s = 0; s < GetSize(signals); s++) by_name[signals[s].dotted_name()] = s;
+		// The source entry has no wire; its label is the -from bit. Example: "in_a[0]" -> in_a.
+		std::vector<int> path;
+		pool<int> on_path;
+		for (auto &entry : entries) {
+			std::string name = entry.wire ? user_name(entry.wire) : split_bit_name(entry.label).first;
+			auto found = by_name.find(name);
+			if (found == by_name.end())
+				log_error("Path signal %s is missing from the waveform.\n", name);
+			if (on_path.insert(found->second).second) path.push_back(found->second);
+		}
+
+		std::ofstream gtkw(filename);
+		if (!gtkw) log_error("Cannot write %s.\n", filename);
+		gtkw << "[dumpfile] \"" << std::filesystem::absolute(vcd_file).string() << "\"\n";
+		// Flags: @28 binary, @22 hex, @200 a comment line. Color 1 is red.
+		auto add_trace = [&](int s) {
+			std::string name = module->name.unescape() + "." + signals[s].dotted_name();
+			gtkw << (GetSize(signals[s].bits_a) == 1 ? "@28\n" : "@22\n") << name << signals[s].range << "\n";
+			gtkw << "@28\n[color] 1\n" << name << "__taint\n";
+		};
+		gtkw << "@200\n-Path from source to destination\n";
+		for (int s : path) add_trace(s);
+		gtkw << "@200\n-\n@200\n-Rest of the destination fanin\n";
+		for (int s = 0; s < GetSize(signals); s++)
+			if (!on_path.count(s)) add_trace(s);
+		log("Wrote %s: %d path signals, %d others.\n", filename, GetSize(path), GetSize(signals) - GetSize(path));
+	}
+
+	void run(const std::string &witness_file, const std::string &dot_file, const std::string &vcd_file,
+		const std::string &gtkw_file)
 	{
 		Cell *assertion = nullptr;
 		for (auto cell : module->cells())
@@ -527,6 +759,12 @@ struct SpvPathWorker
 		}
 		if (!dot_file.empty())
 			write_dot(dot_file, graph, source_bit_names);
+		if (!vcd_file.empty()) {
+			auto signals = wave_signals(comparison->second.cell, graph, source_bit_names);
+			write_vcd(vcd_file, signals);
+			if (!gtkw_file.empty())
+				write_gtkw(gtkw_file, vcd_file, signals, entries);
+		}
 	}
 };
 
@@ -536,7 +774,7 @@ struct SpvPathPass : Pass
 
 	void help() override
 	{
-		log("\n    spv_path -witness <trace.yw> [-dot <file>]\n\n");
+		log("\n    spv_path -witness <trace.yw> [-dot <file>] [-vcd <file> [-gtkw <file>]]\n\n");
 		log("Replay an SPV counterexample and explain it. The text output is the shortest\n");
 		log("path along which run A and run B differ: from an injected -from bit, through\n");
 		log("named signals and registers, to the compared -to bit at the first failing step.\n");
@@ -545,15 +783,20 @@ struct SpvPathPass : Pass
 		log("conditions that let the difference pass.\n\n");
 		log("Run it on SBY's prepared model, from the engine directory of a failing task:\n");
 		log("    read_rtlil ../model/design_prep.il\n");
-		log("    spv_path -witness trace.yw -dot path.dot\n\n");
+		log("    spv_path -witness trace.yw -dot path.dot -vcd path.vcd -gtkw path.gtkw\n\n");
 		log("    -dot <file>    also draw every path from the sources to the destination, one\n");
 		log("                   node per signal; edge labels are the steps at which the\n");
 		log("                   difference crossed that edge (source red, destination blue)\n\n");
+		log("    -vcd <file>    write a taint waveform: the -from signals and every named\n");
+		log("                   signal in the destination's fanin, with run A's value and\n");
+		log("                   <name>__taint = 1 while the runs differ. Step k is at time 10k.\n\n");
+		log("    -gtkw <file>   write a GTKWave view of that waveform: the text path's signals\n");
+		log("                   first, in path order, each followed by its taint in red\n\n");
 	}
 
 	void execute(std::vector<std::string> args, Design *design) override
 	{
-		std::string witness_file, dot_file;
+		std::string witness_file, dot_file, vcd_file, gtkw_file;
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-witness" && argidx + 1 < args.size()) {
@@ -564,14 +807,23 @@ struct SpvPathPass : Pass
 				dot_file = args[++argidx];
 				continue;
 			}
+			if (args[argidx] == "-vcd" && argidx + 1 < args.size()) {
+				vcd_file = args[++argidx];
+				continue;
+			}
+			if (args[argidx] == "-gtkw" && argidx + 1 < args.size()) {
+				gtkw_file = args[++argidx];
+				continue;
+			}
 			break;
 		}
 		extra_args(args, argidx, design);
 		if (witness_file.empty()) log_cmd_error("spv_path requires -witness.\n");
+		if (!gtkw_file.empty() && vcd_file.empty()) log_cmd_error("spv_path -gtkw requires -vcd.\n");
 		Module *module = design->top_module();
 		if (!module) log_cmd_error("spv_path requires a top module.\n");
 		log_header(design, "Executing SPV_PATH pass for %s.\n", module);
-		SpvPathWorker(module).run(witness_file, dot_file);
+		SpvPathWorker(module).run(witness_file, dot_file, vcd_file, gtkw_file);
 	}
 } SpvPathPass;
 
