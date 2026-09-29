@@ -12,6 +12,7 @@
 #include "kernel/celltypes.h"
 #include "kernel/fstdata.h"
 #include "kernel/yw.h"
+#include <charconv>
 #include <filesystem>
 #include <numeric>
 #include <tuple>
@@ -63,6 +64,7 @@ struct WaveSignal
 	std::vector<std::string> scope;
 	std::string name, range; // range is "" for a one-bit wire
 	SigSpec bits_a, bits_b;  // LSB first
+	int first_index = 0;     // -from signals only: HDL index of bits_a[0], the next bits count up
 
 	// Example: scope {"mul"}, name "in_a" -> "mul.in_a".
 	std::string dotted_name() const
@@ -432,9 +434,12 @@ struct SpvPathWorker
 				continue;
 			}
 			Cell *assigner = drivers.at(node.bit_a).cell;
+			// Registers print as "register", not $anyinit: that type only marks a free initial value,
+			// which both runs share, so it must not suggest the difference started there.
+			std::string kind = assigner->type.in(ID($ff), ID($anyinit)) ? "register" : log_id(assigner->type);
 			entries.push_back({wire_a, node.step, node.step, label,
 				log_const(Const(value(node.bit_a, node.step))), log_const(Const(value(node.bit_b, node.step))),
-				stringf("%s %s", log_id(assigner->type), assigner->get_src_attribute()), controls});
+				stringf("%s %s", kind, assigner->get_src_attribute()), controls});
 			controls.clear();
 		}
 		entries.back().note = "destination, " + entries.back().note;
@@ -509,19 +514,35 @@ struct SpvPathWorker
 		log("Wrote %s: %d signals, %d edges.\n", filename, GetSize(signals), GetSize(edges));
 	}
 
-	// Steps of one entry. Example: 4..9 -> "4-9"; 3..3 -> "3".
-	static std::string step_range(const PathEntry &entry)
+	// Steps of a line. Example: 4..9 -> "4-9"; 3..3 -> "3".
+	static std::string step_range(int step, int last_step)
 	{
-		if (entry.step == entry.last_step) return std::to_string(entry.step);
-		return stringf("%d-%d", entry.step, entry.last_step);
+		if (step == last_step) return std::to_string(step);
+		return stringf("%d-%d", step, last_step);
 	}
 
-	// Signals of the taint waveform, like the fanin Jasper exports for a counterexample:
-	// first the -from signals with the values the two runs actually read, then every named
-	// run-A signal in the structural fanin of the destination, sorted by name.
-	// Example: buffered_mul -> in_a, in_b (injected), buff.busy, ..., mul.in_a, ..., out_valid.
-	std::vector<WaveSignal> wave_signals(Cell *comparison, const DiffGraph &graph,
-		const std::vector<std::string> &source_bit_names)
+	// A replayed value as text: one bit as in the path lines, wider values in hex.
+	// A hex digit with an x or z bit prints as x. Example: 1'1 -> "1'1"; 4'b1101 -> "4'hd".
+	static std::string value_text(const Const &value)
+	{
+		if (GetSize(value) == 1) return log_const(value);
+		std::string digits;
+		for (int i = 0; i < GetSize(value); i += 4) {
+			int digit = 0;
+			bool known = true;
+			for (int j = i; j < std::min(i + 4, GetSize(value)); j++) {
+				if (value[j] == State::S1) digit |= 1 << (j - i);
+				else if (value[j] != State::S0) known = false;
+			}
+			digits += known ? "0123456789abcdef"[digit] : 'x';
+		}
+		std::reverse(digits.begin(), digits.end()); // MSB first
+		return stringf("%d'h%s", GetSize(value), digits);
+	}
+
+	// The -from signals with the values the two runs actually read, one signal per -from name.
+	// Example: buffered_mul -> in_a, in_b, each with the run-A and run-B bits of its 4 injected bits.
+	std::vector<WaveSignal> source_signals(const DiffGraph &graph, const std::vector<std::string> &source_bit_names)
 	{
 		// Run A reads the $anyseq that drives a found source bit. Run B reads the output of the
 		// cell that drives the same bit in run B: the source-choice $mux, whose A input is run A's
@@ -538,7 +559,7 @@ struct SpvPathWorker
 		dict<SigBit, SigBit> run_b_of;
 		for (int i = 0; i < GetSize(choice_y); i++)
 			run_b_of[choice_a[i]] = choice_y[i];
-		// A source bit that run B never reads cannot make a visible difference: draw it untainted.
+		// A source bit that run B never reads cannot make a visible difference: give run B run A's value.
 		SigSpec injected_b;
 		int unread = 0;
 		for (auto bit : injected_a) {
@@ -547,7 +568,7 @@ struct SpvPathWorker
 			unread += found == run_b_of.end();
 		}
 		if (unread > 0)
-			log("%d of %d source bits are not read by run B; they are drawn without taint.\n",
+			log("%d of %d source bits are not read by run B, so they never differ between the runs.\n",
 				unread, GetSize(injected_a));
 
 		// Group the -from bits into signals. Example: "in_a[0] in_a[1]" -> in_a with (0, 0), (1, 1).
@@ -568,6 +589,7 @@ struct SpvPathWorker
 			signal.scope = split_tokens(name, ".");
 			signal.name = signal.scope.back();
 			signal.scope.pop_back();
+			signal.first_index = bits[0].first;
 			for (int k = 0; k < GetSize(bits); k++) {
 				if (bits[k].first != bits[0].first + k)
 					log_error("Source %s is not one contiguous slice; spv_path cannot draw it as one signal.\n", name);
@@ -580,6 +602,43 @@ struct SpvPathWorker
 					stringf("[%d:%d]", bits.back().first, bits.front().first);
 			signals.push_back(signal);
 		}
+		return signals;
+	}
+
+	// Every named run-A wire paired with its run-B copy, sorted by name. The -from names are
+	// skipped: under them the design reads the injected values, which the source signals hold.
+	// prep may keep a run-A wire whose run-B copy it removed (se_cache: seoperation.fu._output_T_9);
+	// such a signal has empty bits_b, and each caller decides whether that is an error.
+	// Example: buffered_mul -> buff.busy, buff.cnt, ..., mul.in_a, ..., out_valid.
+	std::vector<WaveSignal> named_signals(const std::vector<WaveSignal> &sources)
+	{
+		pool<std::string> source_set;
+		for (auto &source : sources) source_set.insert(source.dotted_name());
+		std::vector<WaveSignal> signals;
+		for (auto wire : module->wires()) {
+			auto hdlname = wire->get_hdlname_attribute();
+			if (GetSize(hdlname) < 3 || hdlname[1] != "run_a") continue;
+			std::string name = user_name(wire);
+			if (source_set.count(name)) continue;
+			auto twin = run_b_wires.find(name);
+			SigSpec bits_b = twin != run_b_wires.end() ? sigmap(twin->second) : SigSpec();
+			WaveSignal signal{{hdlname.begin() + 2, hdlname.end() - 1}, hdlname.back(), "", sigmap(wire), bits_b};
+			if (wire->width > 1)
+				signal.range = stringf("[%d:%d]", wire->to_hdl_index(wire->width - 1), wire->to_hdl_index(0));
+			signals.push_back(signal);
+		}
+		std::sort(signals.begin(), signals.end(),
+			[](const WaveSignal &x, const WaveSignal &y) { return x.dotted_name() < y.dotted_name(); });
+		return signals;
+	}
+
+	// Signals of the taint waveform, like the fanin Jasper exports for a counterexample:
+	// first the -from signals, then every named run-A signal in the structural fanin of the
+	// destination, sorted by name.
+	// Example: buffered_mul -> in_a, in_b (injected), buff.busy, ..., mul.in_a, ..., out_valid.
+	std::vector<WaveSignal> wave_signals(Cell *comparison, const std::vector<WaveSignal> &sources)
+	{
+		std::vector<WaveSignal> signals = sources;
 
 		// Structural fanin of the run-A destination, one cell at a time.
 		pool<SigBit> fanin;
@@ -597,29 +656,14 @@ struct SpvPathWorker
 					for (auto input : sigmap(connection.second)) pending.push_back(input);
 		}
 
-		pool<std::string> source_set(source_names.begin(), source_names.end());
-		std::vector<WaveSignal> fanin_signals;
-		for (auto wire : module->wires()) {
-			auto hdlname = wire->get_hdlname_attribute();
-			if (GetSize(hdlname) < 3 || hdlname[1] != "run_a") continue;
-			SigSpec bits_a = sigmap(wire);
+		for (auto &signal : named_signals(sources)) {
 			bool in_fanin = false;
-			for (auto bit : bits_a) in_fanin |= fanin.count(bit) > 0;
+			for (auto bit : signal.bits_a) in_fanin |= fanin.count(bit) > 0;
 			if (!in_fanin) continue;
-			// Under a -from name the design reads the injected value, which is already listed.
-			std::string name = user_name(wire);
-			if (source_set.count(name)) continue;
-			auto twin = run_b_wires.find(name);
-			if (twin == run_b_wires.end())
-				log_error("Run-A wire %s has no run-B copy.\n", name);
-			WaveSignal signal{{hdlname.begin() + 2, hdlname.end() - 1}, hdlname.back(), "", bits_a, sigmap(twin->second)};
-			if (wire->width > 1)
-				signal.range = stringf("[%d:%d]", wire->to_hdl_index(wire->width - 1), wire->to_hdl_index(0));
-			fanin_signals.push_back(signal);
+			if (signal.bits_b.empty())
+				log_error("Run-A wire %s has no run-B copy.\n", signal.dotted_name());
+			signals.push_back(signal);
 		}
-		std::sort(fanin_signals.begin(), fanin_signals.end(),
-			[](const WaveSignal &x, const WaveSignal &y) { return x.dotted_name() < y.dotted_name(); });
-		signals.insert(signals.end(), fanin_signals.begin(), fanin_signals.end());
 		return signals;
 	}
 
@@ -721,8 +765,47 @@ struct SpvPathWorker
 		log("Wrote %s: %d path signals, %d others.\n", filename, GetSize(path), GetSize(signals) - GetSize(path));
 	}
 
+	// Log one signal's values at the listed steps; consecutive listed steps with the same values
+	// in both runs share a line. For a reader (query = false) only lines where the runs differ
+	// are kept, and a value wider than 64 bits is replaced by its differing bits, at most 16.
+	// For a -show query every line is kept, in full, and marked where the runs differ.
+	// Example: "step 1-2  in_a[3:0]  run_a=4'h0 run_b=4'hd";
+	// wide: "step 2  multiplier[1023:0]  run_a/run_b differ in 5 of 1024 bits: [2]=0/1 [4]=1/0 ...".
+	void log_values(const WaveSignal &signal, const std::vector<bool> &listed, bool query)
+	{
+		const int widest_full_value = 64, most_listed_bits = 16;
+		std::string label = signal.dotted_name() + signal.range;
+		for (int step = 0; step < GetSize(values); step++) {
+			if (!listed[step]) continue;
+			Const value_a = value(signal.bits_a, step), value_b = value(signal.bits_b, step);
+			// Extend the line over the following listed steps that keep both values.
+			int last_step = step;
+			while (last_step + 1 < GetSize(values) && listed[last_step + 1] &&
+			       value(signal.bits_a, last_step + 1) == value_a && value(signal.bits_b, last_step + 1) == value_b)
+				last_step++;
+			std::string text;
+			if (!query && GetSize(value_a) > widest_full_value) {
+				int differing = 0;
+				for (int k = 0; k < GetSize(value_a); k++) {
+					if (value_a[k] == value_b[k]) continue;
+					if (differing++ < most_listed_bits)
+						text += stringf(" [%d]=%s/%s", signal.first_index + k,
+							Const(value_a[k]).as_string(), Const(value_b[k]).as_string());
+				}
+				if (differing > most_listed_bits) text += stringf(" ... %d more", differing - most_listed_bits);
+				text = stringf("run_a/run_b differ in %d of %d bits:", differing, GetSize(value_a)) + text;
+			} else {
+				text = stringf("run_a=%s run_b=%s", value_text(value_a), value_text(value_b));
+				if (query && value_a != value_b) text += "  differs";
+			}
+			if (query || value_a != value_b)
+				log("  step %-9s %-32s %s\n", step_range(step, last_step), label, text);
+			step = last_step;
+		}
+	}
+
 	void run(const std::string &witness_file, const std::string &dot_file, const std::string &vcd_file,
-		const std::string &gtkw_file)
+		const std::string &gtkw_file, const std::vector<std::string> &show_patterns, int first_step, int last_step)
 	{
 		Cell *assertion = nullptr;
 		for (auto cell : module->cells())
@@ -752,15 +835,60 @@ struct SpvPathWorker
 		log("SPV property %s fails at step %d. Shortest path from source to destination:\n",
 			assertion->get_string_attribute(ID(spv_property)), fail_step);
 		for (auto &entry : entries) {
-			log("  step %-9s %-32s run_a=%-5s run_b=%-5s %s\n", step_range(entry), entry.label,
+			log("  step %-9s %-32s run_a=%-5s run_b=%-5s %s\n", step_range(entry.step, entry.last_step), entry.label,
 				entry.value_a, entry.value_b, entry.note);
 			for (auto &control : entry.controls)
 				log("           when %s\n", control);
 		}
+
+		// The path names one source bit; list the whole -from signals so no reader assumes the
+		// other bits are equal. Only the steps the differences trace back to are listed: a free
+		// source may differ at every step, but only those values reach the destination.
+		// Example: "step 1-2  in_a[3:0]  run_a=4'h0 run_b=4'hd".
+		std::vector<bool> traced_step(GetSize(values));
+		for (int n : graph.sources) traced_step[graph.nodes[n].step] = true;
+		auto sources = source_signals(graph, source_bit_names);
+		log("Source values at the steps the differences trace back to:\n");
+		for (auto &source : sources)
+			log_values(source, traced_step, false);
+
+		// Values the user asked for with -show, e.g. to follow a signal that is not on the path.
+		// A -from name shows the injected values both runs read, not the shared top-level input.
+		if (!show_patterns.empty()) {
+			if (last_step < 0) last_step = GetSize(values) - 1;
+			if (first_step < 0) first_step = 0;
+			if (last_step >= GetSize(values) || first_step > last_step)
+				log_error("-steps %d:%d is outside the witness steps 0-%d.\n", first_step, last_step, GetSize(values) - 1);
+			std::vector<bool> shown_step(GetSize(values));
+			for (int step = first_step; step <= last_step; step++) shown_step[step] = true;
+			std::vector<WaveSignal> candidates = sources;
+			for (auto &signal : named_signals(sources)) candidates.push_back(signal);
+			log("Values of the -show signals (hex; \"differs\" marks the steps where the runs differ):\n");
+			for (auto &pattern : show_patterns) {
+				std::regex expression;
+				try {
+					expression = YS_REGEX_COMPILE(pattern);
+				} catch (const std::regex_error &) {
+					log_error("Invalid -show regex '%s'.\n", pattern);
+				}
+				bool matched = false;
+				for (auto &signal : candidates)
+					if (std::regex_match(signal.dotted_name(), expression)) {
+						if (signal.bits_b.empty())
+							log("  %-14s %-32s run B has no copy of this wire after prep\n", "",
+								signal.dotted_name() + signal.range);
+						else
+							log_values(signal, shown_step, true);
+						matched = true;
+					}
+				if (!matched) log_error("No signal matches -show '%s'.\n", pattern);
+			}
+		}
+
 		if (!dot_file.empty())
 			write_dot(dot_file, graph, source_bit_names);
 		if (!vcd_file.empty()) {
-			auto signals = wave_signals(comparison->second.cell, graph, source_bit_names);
+			auto signals = wave_signals(comparison->second.cell, sources);
 			write_vcd(vcd_file, signals);
 			if (!gtkw_file.empty())
 				write_gtkw(gtkw_file, vcd_file, signals, entries);
@@ -774,13 +902,17 @@ struct SpvPathPass : Pass
 
 	void help() override
 	{
-		log("\n    spv_path -witness <trace.yw> [-dot <file>] [-vcd <file> [-gtkw <file>]]\n\n");
+		log("\n    spv_path -witness <trace.yw> [-dot <file>] [-vcd <file> [-gtkw <file>]]\n");
+		log("             [-show <regex>]... [-steps <first>[:<last>]]\n\n");
 		log("Replay an SPV counterexample and explain it. The text output is the shortest\n");
 		log("path along which run A and run B differ: from an injected -from bit, through\n");
 		log("named signals and registers, to the compared -to bit at the first failing step.\n");
 		log("Each line shows the step, both runs' values and the cell and RTL location that\n");
 		log("assign the signal. Mux selects that are equal in both runs are listed as the\n");
-		log("conditions that let the difference pass.\n\n");
+		log("conditions that let the difference pass. After the path, the whole -from\n");
+		log("signals are listed with both runs' values at the steps the differences trace\n");
+		log("back to. Values wider than one bit are hex; a value wider than 64 bits is\n");
+		log("replaced by the bits in which the runs differ.\n\n");
 		log("Run it on SBY's prepared model, from the engine directory of a failing task:\n");
 		log("    read_rtlil ../model/design_prep.il\n");
 		log("    spv_path -witness trace.yw -dot path.dot -vcd path.vcd -gtkw path.gtkw\n\n");
@@ -792,11 +924,29 @@ struct SpvPathPass : Pass
 		log("                   <name>__taint = 1 while the runs differ. Step k is at time 10k.\n\n");
 		log("    -gtkw <file>   write a GTKWave view of that waveform: the text path's signals\n");
 		log("                   first, in path order, each followed by its taint in red\n\n");
+		log("    -show <regex>  also print both runs' values, in full hex, of every signal\n");
+		log("                   whose whole name matches the regex, e.g. mul\\..* or\n");
+		log("                   buff.busy; surrounding \"...\" or '...' are removed. One line\n");
+		log("                   per run of steps with the same values; lines where the runs\n");
+		log("                   differ end with \"differs\". A -from name shows the injected\n");
+		log("                   values the runs read. Repeatable.\n\n");
+		log("    -steps <first>[:<last>]\n");
+		log("                   limit -show to these steps (default: every witness step)\n\n");
 	}
 
 	void execute(std::vector<std::string> args, Design *design) override
 	{
 		std::string witness_file, dot_file, vcd_file, gtkw_file;
+		std::vector<std::string> show_patterns;
+		int first_step = -1, last_step = -1;
+		// Example: "12" -> 12; "-3" or "x" -> error.
+		auto parse_step = [](const std::string &text) {
+			int step;
+			auto parsed = std::from_chars(text.data(), text.data() + text.size(), step);
+			if (parsed.ec != std::errc() || parsed.ptr != text.data() + text.size() || step < 0)
+				log_cmd_error("Invalid step '%s' in -steps.\n", text);
+			return step;
+		};
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-witness" && argidx + 1 < args.size()) {
@@ -815,15 +965,34 @@ struct SpvPathPass : Pass
 				gtkw_file = args[++argidx];
 				continue;
 			}
+			if (args[argidx] == "-show" && argidx + 1 < args.size()) {
+				// Yosys passes quotes through: "..." stays one argument with its quotes, and
+				// '...' is not special at all. Remove either pair. Example: '^mul.cnt$' -> ^mul.cnt$.
+				std::string pattern = args[++argidx];
+				if (pattern.size() >= 2 && (pattern.front() == '"' || pattern.front() == '\'') &&
+				    pattern.back() == pattern.front())
+					pattern = pattern.substr(1, pattern.size() - 2);
+				show_patterns.push_back(pattern);
+				continue;
+			}
+			// Example: "-steps 5" -> 5..5; "-steps 5:9" -> 5..9.
+			if (args[argidx] == "-steps" && argidx + 1 < args.size()) {
+				std::string text = args[++argidx];
+				auto colon = text.find(':');
+				first_step = parse_step(text.substr(0, colon));
+				last_step = colon == std::string::npos ? first_step : parse_step(text.substr(colon + 1));
+				continue;
+			}
 			break;
 		}
 		extra_args(args, argidx, design);
 		if (witness_file.empty()) log_cmd_error("spv_path requires -witness.\n");
 		if (!gtkw_file.empty() && vcd_file.empty()) log_cmd_error("spv_path -gtkw requires -vcd.\n");
+		if (first_step >= 0 && show_patterns.empty()) log_cmd_error("spv_path -steps requires -show.\n");
 		Module *module = design->top_module();
 		if (!module) log_cmd_error("spv_path requires a top module.\n");
 		log_header(design, "Executing SPV_PATH pass for %s.\n", module);
-		SpvPathWorker(module).run(witness_file, dot_file, vcd_file, gtkw_file);
+		SpvPathWorker(module).run(witness_file, dot_file, vcd_file, gtkw_file, show_patterns, first_step, last_step);
 	}
 } SpvPathPass;
 
